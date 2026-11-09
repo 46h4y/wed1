@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -50,6 +51,20 @@ if (isSupabaseConfigured) {
       auth: { persistSession: false },
     });
     console.log('[Database] Initialized with Supabase Cloud at', supabaseUrl);
+    // Background sync on startup to guarantee local store has all cloud records
+    supabase
+      .from('rsvps')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .then(({ data, error }) => {
+        if (!error && Array.isArray(data) && data.length > 0) {
+          console.log(`[Database] Auto-synced ${data.length} records from Supabase into local store.`);
+          writeLocalStore(data);
+        }
+      })
+      .catch((err) => {
+        console.warn('[Database] Initial Supabase background sync notice:', err.message);
+      });
   } catch (err) {
     console.error('[Database] Failed to initialize Supabase client:', err.message);
     supabase = null;
@@ -212,8 +227,10 @@ export const db = {
           .from('rsvps')
           .select('*')
           .order('created_at', { ascending: false });
-        if (!error && Array.isArray(data)) {
-          return data.filter((r) => !tombstoneIds.has(r.id));
+        if (!error && Array.isArray(data) && data.length > 0) {
+          const valid = data.filter((r) => !tombstoneIds.has(r.id));
+          writeLocalStore(valid);
+          return valid;
         }
       } catch (err) {
         console.warn('[Database] Supabase fetch error, using local store:', err.message);

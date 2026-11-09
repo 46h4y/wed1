@@ -19,6 +19,7 @@ import {
   ArrowUpDown,
 } from 'lucide-react';
 import { weddingConfig } from '../config/weddingConfig';
+import { fetchRsvpsFromSupabase, calculateStatsFromRsvps, deleteRsvpFromSupabase } from '../utils/rsvpService';
 
 export function AdminDashboard({ isOpen, onClose }) {
   const { events } = weddingConfig;
@@ -109,42 +110,116 @@ export function AdminDashboard({ isOpen, onClose }) {
 
     setIsLoadingData(true);
     try {
-      // 1. Fetch Stats
-      const statsRes = await fetch('/api/admin/stats', {
-        headers: { 'x-admin-passcode': code },
-      });
-      if (statsRes.status === 401) {
-        setIsAuthenticated(false);
-        setAuthError('Session expired. Please enter the administrator passcode again.');
-        return;
-      }
-      const statsData = await statsRes.json();
-      if (statsRes.ok && statsData.success) {
-        setStats(statsData.data);
-        try {
-          localStorage.setItem('wedding_cached_stats', JSON.stringify(statsData.data));
-        } catch (e) {}
+      let statsLoaded = false;
+      // 1. Attempt to fetch stats from backend API
+      try {
+        const statsRes = await fetch('/api/admin/stats', {
+          headers: { 'x-admin-passcode': code },
+        });
+        if (statsRes.status === 401) {
+          setIsAuthenticated(false);
+          setAuthError('Session expired. Please enter the administrator passcode again.');
+          return;
+        }
+        if (statsRes.ok) {
+          const statsData = await statsRes.json();
+          if (statsData.success && statsData.data) {
+            setStats(statsData.data);
+            statsLoaded = true;
+            try {
+              localStorage.setItem('wedding_cached_stats', JSON.stringify(statsData.data));
+            } catch (e) {}
+          }
+        }
+      } catch (e) {
+        // Backend unavailable
       }
 
-      // 2. Fetch RSVPs with current filters
-      const params = new URLSearchParams({
-        search: searchQuery,
-        status: statusFilter,
-        event: eventFilter,
-        sort: sortOrder,
-      });
+      // 2. Fetch RSVPs from backend API or Supabase Cloud
+      let rawList = [];
+      let fetchedSuccessfully = false;
 
-      const rsvpsRes = await fetch(`/api/admin/rsvps?${params.toString()}`, {
-        headers: { 'x-admin-passcode': code },
-      });
-      if (rsvpsRes.status === 401) {
-        setIsAuthenticated(false);
-        setAuthError('Session expired. Please enter the administrator passcode again.');
-        return;
+      try {
+        const params = new URLSearchParams({
+          search: searchQuery,
+          status: statusFilter,
+          event: eventFilter,
+          sort: sortOrder,
+        });
+
+        const rsvpsRes = await fetch(`/api/admin/rsvps?${params.toString()}`, {
+          headers: { 'x-admin-passcode': code },
+        });
+        if (rsvpsRes.status === 401) {
+          setIsAuthenticated(false);
+          setAuthError('Session expired. Please enter the administrator passcode again.');
+          return;
+        }
+        if (rsvpsRes.ok) {
+          const rsvpsData = await rsvpsRes.json();
+          if (rsvpsData.success && Array.isArray(rsvpsData.data) && rsvpsData.data.length > 0) {
+            rawList = rsvpsData.data;
+            fetchedSuccessfully = true;
+          }
+        }
+      } catch (e) {
+        // Backend unavailable
       }
-      const rsvpsData = await rsvpsRes.json();
-      if (rsvpsRes.ok && rsvpsData.success && Array.isArray(rsvpsData.data)) {
-        let mergedList = [...rsvpsData.data];
+
+      // If backend API did not return data, connect directly to Supabase Cloud
+      if (!fetchedSuccessfully) {
+        const cloudResult = await fetchRsvpsFromSupabase();
+        if (cloudResult.success && Array.isArray(cloudResult.data) && cloudResult.data.length > 0) {
+          rawList = cloudResult.data;
+          fetchedSuccessfully = true;
+
+          // Compute stats directly from cloud data if backend stats weren't loaded
+          if (!statsLoaded) {
+            const calculatedStats = calculateStatsFromRsvps(rawList);
+            setStats(calculatedStats);
+            try {
+              localStorage.setItem('wedding_cached_stats', JSON.stringify(calculatedStats));
+            } catch (e) {}
+            statsLoaded = true;
+          }
+
+          // Apply search, event, status and sort filters to cloud data
+          if (statusFilter !== 'all') {
+            rawList = rawList.filter((r) => r.attendance_status === statusFilter);
+          }
+          if (eventFilter !== 'all') {
+            rawList = rawList.filter((r) => {
+              if (!Array.isArray(r.selected_events)) return false;
+              if (eventFilter === 'wedding' || eventFilter === 'wedding_ceremony') {
+                return r.selected_events.includes('wedding') || r.selected_events.includes('wedding_ceremony');
+              }
+              return r.selected_events.includes(eventFilter);
+            });
+          }
+          if (searchQuery && searchQuery.trim() !== '') {
+            const q = searchQuery.trim().toLowerCase();
+            rawList = rawList.filter((r) => {
+              const nameMatch = (r.guest_name || '').toLowerCase().includes(q);
+              const emailMatch = (r.guest_email || '').toLowerCase().includes(q);
+              const phoneMatch = (r.phone_number || '').toLowerCase().includes(q);
+              const addMatch = (r.additional_guests || '').toLowerCase().includes(q);
+              return nameMatch || emailMatch || phoneMatch || addMatch;
+            });
+          }
+          if (sortOrder === 'name') {
+            rawList.sort((a, b) => (a.guest_name || '').localeCompare(b.guest_name || ''));
+          } else if (sortOrder === 'attendees') {
+            rawList.sort((a, b) => (b.attendees_count || 0) - (a.attendees_count || 0));
+          } else if (sortOrder === 'oldest') {
+            rawList.sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+          } else {
+            rawList.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+          }
+        }
+      }
+
+      if (fetchedSuccessfully || rawList.length > 0) {
+        let mergedList = [...rawList];
         try {
           const deletedIds = new Set(
             JSON.parse(localStorage.getItem('wedding_deleted_ids') || '[]')
@@ -207,21 +282,38 @@ export function AdminDashboard({ isOpen, onClose }) {
     setIsVerifying(true);
 
     try {
-      const res = await fetch('/api/admin/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passcode }),
-      });
+      let isVerified = false;
+      try {
+        const res = await fetch('/api/admin/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passcode }),
+        });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success) {
+          isVerified = true;
+        } else if (res.status === 401) {
+          setAuthError(data.error || 'Invalid passcode. Access denied.');
+          setIsVerifying(false);
+          return;
+        }
+      } catch (networkErr) {
+        // Fallback: verify against configured admin passcode when backend API is offline
+        const expectedCode = import.meta.env.VITE_ADMIN_PASSCODE || 'yashmrudula2026';
+        if (passcode.trim() === expectedCode) {
+          isVerified = true;
+        }
+      }
+
+      if (isVerified) {
         try {
           localStorage.setItem('wedding_admin_passcode', passcode);
         } catch (e) {}
         setIsAuthenticated(true);
         loadDashboardData(passcode);
       } else {
-        setAuthError(data.error || 'Invalid passcode. Access denied.');
+        setAuthError('Invalid passcode. Access denied.');
       }
     } catch (err) {
       setAuthError('Connection error. Could not verify passcode.');
@@ -288,7 +380,50 @@ export function AdminDashboard({ isOpen, onClose }) {
       passcode ||
       (typeof localStorage !== 'undefined' ? localStorage.getItem('wedding_admin_passcode') : '') ||
       '';
-    window.location.href = `/api/admin/export?passcode=${encodeURIComponent(code)}`;
+    if (!rsvps || rsvps.length === 0) {
+      window.location.href = `/api/admin/export?passcode=${encodeURIComponent(code)}`;
+      return;
+    }
+    try {
+      const headers = [
+        'ID',
+        'Guest Name',
+        'Email',
+        'Phone',
+        'Attendance Status',
+        'Attendees Count',
+        'Additional Guests',
+        'Selected Events',
+        'Dietary Requirements',
+        'Special Requests',
+        'Created At',
+      ];
+      const rows = rsvps.map((r) => [
+        `"${(r.id || '').replace(/"/g, '""')}"`,
+        `"${(r.guest_name || '').replace(/"/g, '""')}"`,
+        `"${(r.guest_email || '').replace(/"/g, '""')}"`,
+        `"${(r.phone_number || '').replace(/"/g, '""')}"`,
+        `"${(r.attendance_status || '').replace(/"/g, '""')}"`,
+        r.attendees_count || 0,
+        `"${(r.additional_guests || '').replace(/"/g, '""')}"`,
+        `"${(Array.isArray(r.selected_events) ? r.selected_events.join(', ') : '').replace(/"/g, '""')}"`,
+        `"${(r.dietary_requirements || '').replace(/"/g, '""')}"`,
+        `"${(r.special_requests || '').replace(/"/g, '""')}"`,
+        `"${(r.created_at || '').replace(/"/g, '""')}"`,
+      ]);
+      const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `wedding_rsvps_${new Date().toISOString().slice(0, 10)}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      window.location.href = `/api/admin/export?passcode=${encodeURIComponent(code)}`;
+    }
   };
 
   const handleDeleteRsvp = async (id, name) => {
@@ -302,12 +437,23 @@ export function AdminDashboard({ isOpen, onClose }) {
         (typeof localStorage !== 'undefined' ? localStorage.getItem('wedding_admin_passcode') : '') ||
         '';
 
-      const res = await fetch(`/api/admin/rsvps/${id}`, {
-        method: 'DELETE',
-        headers: { 'x-admin-passcode': code },
-      });
+      let deleteSuccess = false;
+      try {
+        const res = await fetch(`/api/admin/rsvps/${id}`, {
+          method: 'DELETE',
+          headers: { 'x-admin-passcode': code },
+        });
 
-      if (res.ok) {
+        if (res.ok) {
+          deleteSuccess = true;
+        }
+      } catch (e) {
+        // Fallback directly to Supabase Cloud
+        const cloudDelete = await deleteRsvpFromSupabase(id);
+        if (cloudDelete.success) deleteSuccess = true;
+      }
+
+      if (deleteSuccess) {
         // Record deleted ID in tombstone list so it never resurrects from client cache
         try {
           const deletedIds = JSON.parse(localStorage.getItem('wedding_deleted_ids') || '[]');
@@ -331,8 +477,7 @@ export function AdminDashboard({ isOpen, onClose }) {
         // Re-fetch fresh stats & verified dataset
         loadDashboardData(code);
       } else {
-        const data = await res.json().catch(() => ({}));
-        alert(data.error || 'Failed to delete RSVP record.');
+        alert('Failed to delete RSVP record.');
       }
     } catch (err) {
       alert('Failed to delete RSVP record.');

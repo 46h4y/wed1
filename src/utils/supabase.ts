@@ -1,15 +1,16 @@
 /// <reference types="vite/client" />
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseUrl =
+  import.meta.env.VITE_SUPABASE_URL || 'https://lnzuragdrwcufsriizmp.supabase.co';
 const supabaseKey =
   import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
-  import.meta.env.VITE_SUPABASE_ANON_KEY;
+  import.meta.env.VITE_SUPABASE_ANON_KEY ||
+  'sb_publishable_JkAg5mfz18_4wwrAawM4PQ_GlgZ1C-H';
 
-if (!supabaseUrl || !supabaseKey) {
-  throw new Error(
-    'Missing Supabase environment variables. Please ensure VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY are configured in your .env file.'
-  );
-}
-
-export const supabase = createClient(supabaseUrl, supabaseKey);
+export const supabase =
+  supabaseUrl && supabaseKey
+    ? createClient(supabaseUrl, supabaseKey, {
+        auth: { persistSession: false },
+      })
+    : null;
